@@ -1,17 +1,21 @@
-import anthropic
 from typing import List, Dict, Any, Optional
 import json
 import logging
 from ..config import settings
+from .langchain_config import (
+    langchain_config,
+    create_legal_document_chain,
+    create_legal_analysis_chain,
+    create_entity_extraction_chain,
+    LegalDocumentPrompts
+)
 
 logger = logging.getLogger(__name__)
 
-class ClaudeClient:
+class LangChainClaudeClient:
     def __init__(self):
-        self.client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
-        self.model = settings.claude_model
-        self.max_tokens = settings.max_tokens
-        self.temperature = settings.temperature
+        self.config = langchain_config
+        self.llm = self.config.anthropic_llm
         
     async def generate_legal_document(
         self,
@@ -21,26 +25,21 @@ class ClaudeClient:
         template: Optional[str] = None,
         variables: Optional[Dict[str, Any]] = None
     ) -> str:
-        """Generate a legal document using Claude."""
         try:
-            system_prompt = self._build_legal_system_prompt(document_type)
-            user_prompt = self._build_generation_prompt(
-                document_type, prompt, context_chunks, template, variables
+            result = await create_legal_document_chain(
+                config=self.config,
+                document_type=document_type,
+                requirements=prompt,
+                context_chunks=context_chunks,
+                template=template,
+                variables=variables
             )
             
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                temperature=self.temperature,
-                system=system_prompt,
-                messages=[
-                    {"role": "user", "content": user_prompt}
-                ]
-            )
+            logger.info(f"Generated {document_type} document using LangChain")
+            return result
             
-            return response.content[0].text
         except Exception as e:
-            logger.error(f"Error generating legal document: {str(e)}")
+            logger.error(f"Error generating legal document with LangChain: {str(e)}")
             raise
 
     async def analyze_legal_document(
@@ -49,161 +48,311 @@ class ClaudeClient:
         analysis_type: str,
         context_chunks: Optional[List[str]] = None
     ) -> Dict[str, Any]:
-        """Analyze a legal document for various aspects."""
         try:
-            system_prompt = self._build_analysis_system_prompt(analysis_type)
-            user_prompt = self._build_analysis_prompt(content, analysis_type, context_chunks)
-            
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                temperature=0.3,  # Lower temperature for analysis
-                system=system_prompt,
-                messages=[
-                    {"role": "user", "content": user_prompt}
-                ]
+            result = await create_legal_analysis_chain(
+                config=self.config,
+                analysis_type=analysis_type,
+                content=content,
+                context_chunks=context_chunks
             )
             
-            # Try to parse as JSON, fallback to text
-            try:
-                return json.loads(response.content[0].text)
-            except json.JSONDecodeError:
-                return {"analysis": response.content[0].text}
+            if isinstance(result, str):
+                try:
+                    return json.loads(result)
+                except json.JSONDecodeError:
+                    return {"analysis": result}
+            
+            logger.info(f"Completed {analysis_type} analysis using LangChain")
+            return result
                 
         except Exception as e:
-            logger.error(f"Error analyzing legal document: {str(e)}")
+            logger.error(f"Error analyzing legal document with LangChain: {str(e)}")
             raise
 
     async def extract_legal_entities(self, content: str) -> Dict[str, List[str]]:
-        """Extract legal entities from document content."""
         try:
-            system_prompt = """You are a legal document analysis expert. Extract key legal entities from the provided document content."""
+            result = await create_entity_extraction_chain(
+                config=self.config,
+                content=content
+            )
             
-            user_prompt = f"""
-            Extract the following legal entities from this document:
-            - Parties (individuals, companies, organizations)
-            - Dates (important dates, deadlines, effective dates)
-            - Financial amounts (payments, penalties, fees)
-            - Legal terms and clauses
-            - Jurisdictions and governing law
-            - Contract terms and conditions
+            if isinstance(result, str):
+                try:
+                    return json.loads(result)
+                except json.JSONDecodeError:
+                    return {"entities": result}
             
-            Return the results as a JSON object with each entity type as a key and a list of extracted entities as values.
+            logger.info("Extracted legal entities using LangChain")
+            return result
+                
+        except Exception as e:
+            logger.error(f"Error extracting legal entities with LangChain: {str(e)}")
+            raise
+
+    async def generate_legal_summary(
+        self, 
+        content: str, 
+        focus_areas: Optional[List[str]] = None
+    ) -> str:
+        try:
+            focus_text = ""
+            if focus_areas:
+                focus_text = f"Focus specifically on these areas: {', '.join(focus_areas)}"
+            
+            analysis_prompt = f"""
+            Provide a comprehensive legal summary of the following document. {focus_text}
+            
+            Include:
+            1. Main purpose and type of document
+            2. Key parties involved
+            3. Important terms and conditions
+            4. Critical dates and deadlines
+            5. Rights and obligations
+            6. Legal implications and considerations
             
             Document content:
             {content}
             """
             
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=2000,
-                temperature=0.1,
-                system=system_prompt,
-                messages=[
-                    {"role": "user", "content": user_prompt}
-                ]
-            )
+            result = await self.llm.ainvoke([
+                ("human", analysis_prompt)
+            ])
             
-            try:
-                return json.loads(response.content[0].text)
-            except json.JSONDecodeError:
-                return {"entities": response.content[0].text}
-                
+            logger.info("Generated legal summary using LangChain")
+            return result.content
+            
         except Exception as e:
-            logger.error(f"Error extracting legal entities: {str(e)}")
+            logger.error(f"Error generating legal summary with LangChain: {str(e)}")
             raise
 
-    def _build_legal_system_prompt(self, document_type: str) -> str:
-        """Build system prompt for legal document generation."""
-        base_prompt = """You are an expert legal document assistant specializing in creating high-quality, professional legal documents. 
-        You have deep knowledge of legal terminology, document structure, and best practices for various types of legal documents.
-        
-        Always ensure that:
-        1. Documents are well-structured and professionally formatted
-        2. Legal language is precise and appropriate
-        3. All necessary clauses and sections are included
-        4. Documents comply with general legal standards
-        5. Placeholder text is clearly marked for user customization
-        
-        Important: These documents should be reviewed by qualified legal professionals before use."""
-        
-        document_specific = {
-            "contract": "Focus on creating comprehensive contracts with clear terms, conditions, and obligations.",
-            "agreement": "Create formal agreements with proper legal structure and mutual obligations.",
-            "declaration": "Draft clear, factual declarations with appropriate legal language.",
-            "motion": "Prepare formal legal motions with proper citations and legal arguments.",
-            "brief": "Create well-researched legal briefs with strong arguments and citations.",
-            "memorandum": "Draft professional legal memoranda with clear analysis and recommendations.",
-            "will": "Prepare comprehensive wills with proper legal formalities and clarity.",
-            "power_of_attorney": "Create detailed power of attorney documents with specific powers and limitations.",
-            "lease": "Draft comprehensive lease agreements with clear terms and conditions.",
-            "nda": "Prepare thorough non-disclosure agreements with appropriate scope and protections."
-        }
-        
-        specific_guidance = document_specific.get(document_type, "Create a professional legal document.")
-        return f"{base_prompt}\n\n{specific_guidance}"
-
-    def _build_generation_prompt(
-        self,
-        document_type: str,
-        prompt: str,
-        context_chunks: Optional[List[str]] = None,
-        template: Optional[str] = None,
-        variables: Optional[Dict[str, Any]] = None
-    ) -> str:
-        """Build user prompt for document generation."""
-        user_prompt = f"Create a {document_type} based on the following requirements:\n\n{prompt}\n\n"
-        
-        if template:
-            user_prompt += f"Use this template as a starting point:\n{template}\n\n"
-        
-        if variables:
-            user_prompt += f"Include these specific details:\n{json.dumps(variables, indent=2)}\n\n"
-        
-        if context_chunks:
-            user_prompt += "Use the following relevant legal precedents and context:\n"
-            for i, chunk in enumerate(context_chunks, 1):
-                user_prompt += f"\nContext {i}:\n{chunk}\n"
-        
-        user_prompt += "\nPlease generate a complete, professional legal document."
-        return user_prompt
-
-    def _build_analysis_system_prompt(self, analysis_type: str) -> str:
-        """Build system prompt for legal document analysis."""
-        base_prompt = """You are an expert legal analyst with deep knowledge of legal documents, contracts, and legal principles. 
-        Provide thorough, accurate analysis with attention to legal nuances and potential issues."""
-        
-        analysis_specific = {
-            "summary": "Provide clear, concise summaries that capture key points and legal implications.",
-            "risk_assessment": "Identify potential legal risks, liabilities, and areas of concern with recommendations.",
-            "compliance_check": "Review for compliance with relevant laws, regulations, and legal standards.",
-            "clause_extraction": "Extract and categorize key clauses, terms, and provisions with explanations."
-        }
-        
-        specific_guidance = analysis_specific.get(analysis_type, "Provide thorough legal analysis.")
-        return f"{base_prompt}\n\n{specific_guidance}"
-
-    def _build_analysis_prompt(
+    async def check_document_compliance(
         self,
         content: str,
-        analysis_type: str,
+        regulations: List[str],
+        jurisdiction: str = "federal"
+    ) -> Dict[str, Any]:
+        try:
+            compliance_prompt = f"""
+            Review the following legal document for compliance with these regulations: {', '.join(regulations)}
+            Jurisdiction: {jurisdiction}
+            
+            Provide a detailed compliance analysis including:
+            1. Compliance status for each regulation
+            2. Areas of non-compliance or concern
+            3. Recommendations for improvement
+            4. Risk assessment
+            
+            Return the results as a JSON object with this structure:
+            {{
+                "overall_compliance_score": 0.0-1.0,
+                "regulation_compliance": {{
+                    "regulation_name": {{
+                        "compliant": true/false,
+                        "issues": ["list of issues"],
+                        "recommendations": ["list of recommendations"]
+                    }}
+                }},
+                "risk_level": "low/medium/high",
+                "summary": "overall compliance summary"
+            }}
+            
+            Document content:
+            {content}
+            """
+            
+            result = await self.llm.ainvoke([
+                ("human", compliance_prompt)
+            ])
+            
+            try:
+                return json.loads(result.content)
+            except json.JSONDecodeError:
+                return {"compliance_analysis": result.content}
+                
+        except Exception as e:
+            logger.error(f"Error checking document compliance with LangChain: {str(e)}")
+            raise
+
+    async def generate_contract_amendments(
+        self,
+        original_contract: str,
+        amendment_requests: List[str],
         context_chunks: Optional[List[str]] = None
     ) -> str:
-        """Build user prompt for document analysis."""
-        prompts = {
-            "summary": "Provide a comprehensive summary of this legal document, highlighting key terms, obligations, and important provisions.",
-            "risk_assessment": "Analyze this document for potential legal risks, liabilities, and areas of concern. Provide recommendations for mitigation.",
-            "compliance_check": "Review this document for compliance with relevant laws and regulations. Identify any potential compliance issues.",
-            "clause_extraction": "Extract and categorize all important clauses, terms, and provisions from this document. Explain their legal significance."
-        }
-        
-        user_prompt = f"{prompts.get(analysis_type, 'Analyze this legal document.')}\n\n"
-        user_prompt += f"Document content:\n{content}\n\n"
-        
-        if context_chunks:
-            user_prompt += "Consider this additional legal context:\n"
-            for i, chunk in enumerate(context_chunks, 1):
-                user_prompt += f"\nContext {i}:\n{chunk}\n"
-        
-        user_prompt += f"\nProvide a detailed {analysis_type} in JSON format with structured results."
-        return user_prompt 
+        try:
+            context_text = ""
+            if context_chunks:
+                context_text = f"Relevant legal context:\n{chr(10).join(context_chunks)}"
+            
+            amendment_prompt = f"""
+            Generate contract amendments for the following requests:
+            {chr(10).join([f"- {req}" for req in amendment_requests])}
+            
+            Original contract:
+            {original_contract}
+            
+            {context_text}
+            
+            Create professional contract amendment language that:
+            1. Clearly identifies what is being changed
+            2. Uses proper legal formatting
+            3. Maintains consistency with the original contract
+            4. Includes necessary legal clauses for amendments
+            5. Preserves the integrity of unchanged provisions
+            """
+            
+            result = await self.llm.ainvoke([
+                ("human", amendment_prompt)
+            ])
+            
+            logger.info("Generated contract amendments using LangChain")
+            return result.content
+            
+        except Exception as e:
+            logger.error(f"Error generating contract amendments with LangChain: {str(e)}")
+            raise
+
+    async def analyze_contract_risks(
+        self,
+        contract_content: str,
+        business_context: Optional[str] = None
+    ) -> Dict[str, Any]:
+        try:
+            context_text = ""
+            if business_context:
+                context_text = f"Business context: {business_context}"
+            
+            risk_prompt = f"""
+            Perform a comprehensive risk analysis of this contract. {context_text}
+            
+            Analyze and identify:
+            1. Financial risks and liabilities
+            2. Legal compliance risks
+            3. Operational risks
+            4. Termination and dispute resolution risks
+            5. Intellectual property risks
+            6. Performance and delivery risks
+            
+            Return results as JSON:
+            {{
+                "overall_risk_score": 0.0-1.0,
+                "risk_categories": {{
+                    "financial": {{"score": 0.0-1.0, "issues": [], "recommendations": []}},
+                    "legal": {{"score": 0.0-1.0, "issues": [], "recommendations": []}},
+                    "operational": {{"score": 0.0-1.0, "issues": [], "recommendations": []}},
+                    "termination": {{"score": 0.0-1.0, "issues": [], "recommendations": []}},
+                    "intellectual_property": {{"score": 0.0-1.0, "issues": [], "recommendations": []}},
+                    "performance": {{"score": 0.0-1.0, "issues": [], "recommendations": []}}
+                }},
+                "critical_issues": [],
+                "mitigation_strategies": []
+            }}
+            
+            Contract content:
+            {contract_content}
+            """
+            
+            result = await self.llm.ainvoke([
+                ("human", risk_prompt)
+            ])
+            
+            try:
+                return json.loads(result.content)
+            except json.JSONDecodeError:
+                return {"risk_analysis": result.content}
+                
+        except Exception as e:
+            logger.error(f"Error analyzing contract risks with LangChain: {str(e)}")
+            raise
+
+    async def generate_legal_research_queries(
+        self,
+        topic: str,
+        jurisdiction: str = "federal",
+        document_types: Optional[List[str]] = None
+    ) -> List[str]:
+        try:
+            doc_types_text = ""
+            if document_types:
+                doc_types_text = f"Focus on these document types: {', '.join(document_types)}"
+            
+            research_prompt = f"""
+            Generate effective legal research queries for the topic: {topic}
+            Jurisdiction: {jurisdiction}
+            {doc_types_text}
+            
+            Create 5-7 specific, targeted research queries that would help find:
+            1. Relevant case law
+            2. Applicable statutes and regulations
+            3. Legal precedents
+            4. Recent legal developments
+            5. Practical guidance and commentary
+            
+            Return as a JSON array of query strings.
+            """
+            
+            result = await self.llm.ainvoke([
+                ("human", research_prompt)
+            ])
+            
+            try:
+                queries = json.loads(result.content)
+                if isinstance(queries, list):
+                    return queries
+                else:
+                    return [str(queries)]
+            except json.JSONDecodeError:
+                return [result.content]
+                
+        except Exception as e:
+            logger.error(f"Error generating research queries with LangChain: {str(e)}")
+            raise
+
+    async def draft_legal_memo(
+        self,
+        issue: str,
+        facts: str,
+        legal_authorities: Optional[List[str]] = None,
+        conclusion: Optional[str] = None
+    ) -> str:
+        try:
+            authorities_text = ""
+            if legal_authorities:
+                authorities_text = f"Legal authorities to consider:\n{chr(10).join(legal_authorities)}"
+            
+            conclusion_text = ""
+            if conclusion:
+                conclusion_text = f"Preferred conclusion/recommendation: {conclusion}"
+            
+            memo_prompt = f"""
+            Draft a professional legal memorandum addressing the following:
+            
+            Issue: {issue}
+            
+            Facts: {facts}
+            
+            {authorities_text}
+            
+            {conclusion_text}
+            
+            Structure the memorandum with:
+            1. MEMORANDUM header with TO/FROM/DATE/RE
+            2. ISSUE PRESENTED
+            3. BRIEF ANSWER
+            4. FACTS
+            5. DISCUSSION (with legal analysis)
+            6. CONCLUSION
+            
+            Use proper legal citation format and professional legal writing style.
+            """
+            
+            result = await self.llm.ainvoke([
+                ("human", memo_prompt)
+            ])
+            
+            logger.info("Generated legal memorandum using LangChain")
+            return result.content
+            
+        except Exception as e:
+            logger.error(f"Error drafting legal memo with LangChain: {str(e)}")
+            raise 

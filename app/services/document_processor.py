@@ -7,21 +7,24 @@ import logging
 from pathlib import Path
 import aiofiles
 import magic
-# Document processing imports
-import PyPDF2
-from docx import Document as DocxDocument
-import docx
-import zipfile
 import tempfile
+
+from langchain_community.document_loaders import (
+    PyPDFLoader,
+    Docx2txtLoader,
+    TextLoader,
+    UnstructuredRTFLoader
+)
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from ..config import settings
 from ..models.schemas import DocumentType
+from .langchain_config import langchain_config
 
 logger = logging.getLogger(__name__)
 
-class DocumentProcessor:
-    """Service for processing and extracting content from various document formats."""
-    
+class LangChainDocumentProcessor:
     SUPPORTED_FORMATS = {
         'pdf': 'application/pdf',
         'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -33,6 +36,8 @@ class DocumentProcessor:
     def __init__(self):
         self.storage_path = Path(settings.document_storage_path)
         self.storage_path.mkdir(exist_ok=True)
+        self.config = langchain_config
+        self.text_splitter = self.config.text_splitter
     
     async def process_uploaded_document(
         self,
@@ -43,27 +48,20 @@ class DocumentProcessor:
         owner_id: int,
         metadata: Optional[Dict[str, Any]] = None
     ) -> Tuple[Dict[str, Any], str]:
-        """Process an uploaded document and extract its content."""
         try:
-            # Validate file format
             file_format = await self._detect_file_format(file_content, filename)
             if not file_format:
                 raise ValueError(f"Unsupported file format: {filename}")
             
-            # Save file to storage
             file_path = await self._save_file(file_content, filename, owner_id)
             
-            # Extract text content
-            content = await self._extract_content(file_content, file_format)
+            content = await self._extract_content_with_langchain(file_path, file_format)
             
-            # Extract metadata from file
             extracted_metadata = await self.extract_document_metadata(file_content, file_format)
             
-            # Combine with provided metadata
             final_metadata = metadata or {}
             final_metadata.update(extracted_metadata)
             
-            # Create document info
             document_info = {
                 "title": title,
                 "filename": filename,
@@ -74,25 +72,21 @@ class DocumentProcessor:
                 "file_size": len(file_content)
             }
             
-            logger.info(f"Processed document: {filename}")
+            logger.info(f"Processed document: {filename} using LangChain")
             return document_info, content
             
         except Exception as e:
-            logger.error(f"Error processing document {filename}: {str(e)}")
+            logger.error(f"Error processing document {filename} with LangChain: {str(e)}")
             raise
     
     async def _detect_file_format(self, file_content: bytes, filename: str) -> Optional[str]:
-        """Detect the file format based on content and filename."""
         try:
-            # Try to detect MIME type from content
             mime_type = magic.from_buffer(file_content, mime=True)
             
-            # Check against supported formats
             for format_name, format_mime in self.SUPPORTED_FORMATS.items():
                 if mime_type == format_mime:
                     return format_name
             
-            # Fallback to file extension
             file_ext = Path(filename).suffix.lower().lstrip('.')
             if file_ext in self.SUPPORTED_FORMATS:
                 return file_ext
@@ -104,20 +98,16 @@ class DocumentProcessor:
             return None
     
     async def _save_file(self, file_content: bytes, filename: str, owner_id: int) -> Path:
-        """Save file to storage with organized directory structure."""
         try:
-            # Create user-specific directory
             user_dir = self.storage_path / f"user_{owner_id}"
             user_dir.mkdir(exist_ok=True)
             
-            # Generate unique filename
             timestamp = int(asyncio.get_event_loop().time())
             file_extension = Path(filename).suffix
             unique_filename = f"{timestamp}_{filename}"
             
             file_path = user_dir / unique_filename
             
-            # Save file asynchronously
             async with aiofiles.open(file_path, 'wb') as f:
                 await f.write(file_content)
             
@@ -127,290 +117,334 @@ class DocumentProcessor:
             logger.error(f"Error saving file {filename}: {str(e)}")
             raise
     
-    async def _extract_content(self, file_content: bytes, file_format: str) -> str:
-        """Extract text content from file based on format."""
+    async def _extract_content_with_langchain(self, file_path: Path, file_format: str) -> str:
         try:
             if file_format == 'pdf':
-                return await self._extract_pdf_content(file_content)
+                loader = PyPDFLoader(str(file_path))
             elif file_format == 'docx':
-                return await self._extract_docx_content(file_content)
+                loader = Docx2txtLoader(str(file_path))
             elif file_format == 'txt':
-                return file_content.decode('utf-8', errors='ignore')
+                loader = TextLoader(str(file_path), encoding='utf-8')
             elif file_format == 'rtf':
-                return await self._extract_rtf_content(file_content)
+                loader = UnstructuredRTFLoader(str(file_path))
             else:
-                raise ValueError(f"Unsupported format for content extraction: {file_format}")
-                
-        except Exception as e:
-            logger.error(f"Error extracting content from {file_format}: {str(e)}")
-            raise
-    
-    async def _extract_pdf_content(self, file_content: bytes) -> str:
-        """Extract text content from PDF."""
-        try:
-            # Create a temporary file for PDF processing
-            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
-                temp_file.write(file_content)
-                temp_file_path = temp_file.name
+                raise ValueError(f"Unsupported format for LangChain extraction: {file_format}")
             
-            try:
-                text_content = ""
-                with open(temp_file_path, 'rb') as file:
-                    pdf_reader = PyPDF2.PdfReader(file)
-                    
-                    for page_num in range(len(pdf_reader.pages)):
-                        page = pdf_reader.pages[page_num]
-                        text_content += page.extract_text() + "\n"
-                
-                return text_content.strip()
-                
-            finally:
-                # Clean up temporary file
-                os.unlink(temp_file_path)
-                
-        except Exception as e:
-            logger.error(f"Error extracting PDF content: {str(e)}")
-            raise
-    
-    async def _extract_docx_content(self, file_content: bytes) -> str:
-        """Extract text content from DOCX."""
-        try:
-            # Create a temporary file for DOCX processing
-            with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as temp_file:
-                temp_file.write(file_content)
-                temp_file_path = temp_file.name
+            documents = loader.load()
             
-            try:
-                doc = DocxDocument(temp_file_path)
-                text_content = ""
-                
-                # Extract text from paragraphs
-                for paragraph in doc.paragraphs:
-                    text_content += paragraph.text + "\n"
-                
-                # Extract text from tables
-                for table in doc.tables:
-                    for row in table.rows:
-                        for cell in row.cells:
-                            text_content += cell.text + " "
-                        text_content += "\n"
-                
-                return text_content.strip()
-                
-            finally:
-                # Clean up temporary file
-                os.unlink(temp_file_path)
-                
-        except Exception as e:
-            logger.error(f"Error extracting DOCX content: {str(e)}")
-            raise
-    
-    async def _extract_rtf_content(self, file_content: bytes) -> str:
-        """Extract text content from RTF (basic implementation)."""
-        try:
-            # This is a simplified RTF parser
-            # For production, consider using a proper RTF library like striprtf
+            content = "\n\n".join([doc.page_content for doc in documents])
             
-            content = file_content.decode('utf-8', errors='ignore')
-            
-            # Remove RTF control codes (basic cleanup)
-            import re
-            
-            # Remove RTF control words
-            content = re.sub(r'\\[a-z]+\d*\s?', '', content)
-            # Remove braces
-            content = re.sub(r'[{}]', '', content)
-            # Clean up whitespace
-            content = re.sub(r'\s+', ' ', content)
-            
+            logger.info(f"Extracted content using LangChain {file_format} loader")
             return content.strip()
-            
+                
         except Exception as e:
-            logger.error(f"Error extracting RTF content: {str(e)}")
+            logger.error(f"Error extracting content from {file_format} with LangChain: {str(e)}")
             raise
     
-    async def _extract_content_from_file(self, file_path: str) -> str:
-        """Extract content from an existing file."""
+    async def load_document_as_langchain_docs(
+        self,
+        file_path: str,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> List[Document]:
         try:
-            async with aiofiles.open(file_path, 'rb') as f:
-                file_content = await f.read()
+            file_path_obj = Path(file_path)
+            file_format = file_path_obj.suffix.lower().lstrip('.')
             
-            file_format = await self._detect_file_format(file_content, file_path)
-            if not file_format:
-                raise ValueError(f"Cannot determine format for file: {file_path}")
+            if file_format == 'pdf':
+                loader = PyPDFLoader(file_path)
+            elif file_format == 'docx':
+                loader = Docx2txtLoader(file_path)
+            elif file_format == 'txt':
+                loader = TextLoader(file_path, encoding='utf-8')
+            elif file_format == 'rtf':
+                loader = UnstructuredRTFLoader(file_path)
+            else:
+                raise ValueError(f"Unsupported file format: {file_format}")
             
-            return await self._extract_content(file_content, file_format)
+            documents = loader.load()
+            
+            if metadata:
+                for doc in documents:
+                    doc.metadata.update(metadata)
+            
+            logger.info(f"Loaded {len(documents)} document chunks using LangChain")
+            return documents
             
         except Exception as e:
-            logger.error(f"Error extracting content from file {file_path}: {str(e)}")
+            logger.error(f"Error loading document as LangChain docs: {str(e)}")
+            raise
+    
+    async def split_document_into_chunks(
+        self,
+        content: str,
+        chunk_size: Optional[int] = None,
+        chunk_overlap: Optional[int] = None
+    ) -> List[str]:
+        try:
+            if chunk_size or chunk_overlap:
+                text_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=chunk_size or settings.max_chunk_size,
+                    chunk_overlap=chunk_overlap or settings.chunk_overlap,
+                    length_function=len,
+                    separators=["\n\n", "\n", ".", " ", ""]
+                )
+            else:
+                text_splitter = self.text_splitter
+            
+            chunks = text_splitter.split_text(content)
+            
+            logger.info(f"Split document into {len(chunks)} chunks using LangChain")
+            return chunks
+            
+        except Exception as e:
+            logger.error(f"Error splitting document into chunks with LangChain: {str(e)}")
+            raise
+    
+    async def process_document_with_chunks(
+        self,
+        file_path: str,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> List[Document]:
+        try:
+            documents = await self.load_document_as_langchain_docs(file_path, metadata)
+            
+            chunked_documents = []
+            for doc in documents:
+                chunks = self.text_splitter.split_text(doc.page_content)
+                
+                for i, chunk in enumerate(chunks):
+                    chunk_metadata = doc.metadata.copy()
+                    chunk_metadata.update({
+                        "chunk_index": i,
+                        "total_chunks": len(chunks),
+                        "source_page": chunk_metadata.get("page", 0)
+                    })
+                    
+                    chunked_documents.append(Document(
+                        page_content=chunk,
+                        metadata=chunk_metadata
+                    ))
+            
+            logger.info(f"Processed document into {len(chunked_documents)} chunks")
+            return chunked_documents
+            
+        except Exception as e:
+            logger.error(f"Error processing document with chunks: {str(e)}")
             raise
     
     async def extract_document_metadata(self, file_content: bytes, file_format: str) -> Dict[str, Any]:
-        """Extract metadata from document."""
-        metadata = {
-            "file_size": len(file_content),
-            "format": file_format
-        }
-        
         try:
+            metadata = {
+                "file_format": file_format,
+                "file_size": len(file_content),
+                "processed_at": asyncio.get_event_loop().time(),
+                "processor": "LangChain"
+            }
+            
             if file_format == 'pdf':
-                metadata.update(await self._extract_pdf_metadata(file_content))
+                metadata.update(await self._extract_pdf_metadata_langchain(file_content))
             elif file_format == 'docx':
-                metadata.update(await self._extract_docx_metadata(file_content))
+                metadata.update(await self._extract_docx_metadata_langchain(file_content))
+            
+            return metadata
             
         except Exception as e:
-            logger.warning(f"Could not extract metadata: {str(e)}")
-        
-        return metadata
+            logger.error(f"Error extracting metadata with LangChain: {str(e)}")
+            return {"file_format": file_format, "processor": "LangChain"}
     
-    async def _extract_pdf_metadata(self, file_content: bytes) -> Dict[str, Any]:
-        """Extract metadata from PDF."""
-        metadata = {}
-        
+    async def _extract_pdf_metadata_langchain(self, file_content: bytes) -> Dict[str, Any]:
         try:
             with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
                 temp_file.write(file_content)
                 temp_file_path = temp_file.name
             
             try:
-                with open(temp_file_path, 'rb') as file:
-                    pdf_reader = PyPDF2.PdfReader(file)
-                    
-                    metadata["page_count"] = len(pdf_reader.pages)
-                    
-                    if pdf_reader.metadata:
-                        if '/Title' in pdf_reader.metadata:
-                            metadata["title"] = pdf_reader.metadata['/Title']
-                        if '/Author' in pdf_reader.metadata:
-                            metadata["author"] = pdf_reader.metadata['/Author']
-                        if '/Creator' in pdf_reader.metadata:
-                            metadata["creator"] = pdf_reader.metadata['/Creator']
-                        if '/CreationDate' in pdf_reader.metadata:
-                            metadata["creation_date"] = str(pdf_reader.metadata['/CreationDate'])
+                loader = PyPDFLoader(temp_file_path)
+                documents = loader.load()
+                
+                return {
+                    "total_pages": len(documents),
+                    "page_count": len(documents),
+                    "extraction_method": "LangChain_PyPDFLoader"
+                }
                 
             finally:
                 os.unlink(temp_file_path)
                 
         except Exception as e:
-            logger.warning(f"Error extracting PDF metadata: {str(e)}")
-        
-        return metadata
+            logger.error(f"Error extracting PDF metadata with LangChain: {str(e)}")
+            return {"extraction_method": "LangChain_PyPDFLoader", "error": str(e)}
     
-    async def _extract_docx_metadata(self, file_content: bytes) -> Dict[str, Any]:
-        """Extract metadata from DOCX."""
-        metadata = {}
-        
+    async def _extract_docx_metadata_langchain(self, file_content: bytes) -> Dict[str, Any]:
         try:
             with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as temp_file:
                 temp_file.write(file_content)
                 temp_file_path = temp_file.name
             
             try:
-                doc = DocxDocument(temp_file_path)
+                loader = Docx2txtLoader(temp_file_path)
+                documents = loader.load()
                 
-                # Count pages (approximate)
-                paragraph_count = len(doc.paragraphs)
-                metadata["paragraph_count"] = paragraph_count
-                metadata["estimated_pages"] = max(1, paragraph_count // 20)  # Rough estimate
+                total_content = "\n".join([doc.page_content for doc in documents])
                 
-                # Extract core properties if available
-                if hasattr(doc, 'core_properties'):
-                    core_props = doc.core_properties
-                    if core_props.title:
-                        metadata["title"] = core_props.title
-                    if core_props.author:
-                        metadata["author"] = core_props.author
-                    if core_props.created:
-                        metadata["creation_date"] = str(core_props.created)
-                    if core_props.modified:
-                        metadata["modified_date"] = str(core_props.modified)
+                return {
+                    "word_count": len(total_content.split()),
+                    "character_count": len(total_content),
+                    "extraction_method": "LangChain_Docx2txtLoader"
+                }
                 
             finally:
                 os.unlink(temp_file_path)
                 
         except Exception as e:
-            logger.warning(f"Error extracting DOCX metadata: {str(e)}")
-        
-        return metadata
+            logger.error(f"Error extracting DOCX metadata with LangChain: {str(e)}")
+            return {"extraction_method": "LangChain_Docx2txtLoader", "error": str(e)}
     
-    async def delete_document_file(self, file_path: str):
-        """Delete a document file from storage."""
+    async def batch_process_documents(
+        self,
+        file_paths: List[str],
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> List[Document]:
         try:
-            if os.path.exists(file_path):
-                os.unlink(file_path)
-                logger.info(f"Deleted file: {file_path}")
+            all_documents = []
+            
+            for file_path in file_paths:
+                try:
+                    documents = await self.process_document_with_chunks(file_path, metadata)
+                    all_documents.extend(documents)
+                except Exception as e:
+                    logger.error(f"Error processing {file_path}: {str(e)}")
+                    continue
+            
+            logger.info(f"Batch processed {len(file_paths)} files into {len(all_documents)} chunks")
+            return all_documents
             
         except Exception as e:
-            logger.error(f"Error deleting file {file_path}: {str(e)}")
+            logger.error(f"Error in batch processing with LangChain: {str(e)}")
             raise
     
+    async def validate_document_structure(
+        self,
+        documents: List[Document],
+        required_sections: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        try:
+            validation_results = {
+                "total_documents": len(documents),
+                "total_content_length": sum(len(doc.page_content) for doc in documents),
+                "average_chunk_size": 0,
+                "sections_found": [],
+                "missing_sections": [],
+                "validation_score": 0.0
+            }
+            
+            if documents:
+                validation_results["average_chunk_size"] = validation_results["total_content_length"] / len(documents)
+            
+            all_content = "\n".join([doc.page_content for doc in documents])
+            
+            if required_sections:
+                sections_found = []
+                for section in required_sections:
+                    if section.lower() in all_content.lower():
+                        sections_found.append(section)
+                
+                validation_results["sections_found"] = sections_found
+                validation_results["missing_sections"] = [s for s in required_sections if s not in sections_found]
+                validation_results["validation_score"] = len(sections_found) / len(required_sections)
+            
+            return validation_results
+            
+        except Exception as e:
+            logger.error(f"Error validating document structure: {str(e)}")
+            raise
+    
+    async def delete_document_file(self, file_path: str):
+        try:
+            path_obj = Path(file_path)
+            if path_obj.exists():
+                path_obj.unlink()
+                logger.info(f"Deleted document file: {file_path}")
+            else:
+                logger.warning(f"File not found for deletion: {file_path}")
+        except Exception as e:
+            logger.error(f"Error deleting document file {file_path}: {str(e)}")
+    
     async def validate_document_content(self, content: str, document_type: DocumentType) -> Dict[str, Any]:
-        """Validate document content based on type."""
-        validation_results = {
-            "is_valid": True,
-            "issues": [],
-            "word_count": len(content.split()),
-            "character_count": len(content),
-            "estimated_reading_time": len(content.split()) / 200  # Average reading speed
-        }
-        
-        # Basic content validation
-        if len(content.strip()) < 10:
-            validation_results["is_valid"] = False
-            validation_results["issues"].append("Document content is too short")
-        
-        # Type-specific validation
-        if document_type == DocumentType.CONTRACT:
-            if "party" not in content.lower() and "parties" not in content.lower():
-                validation_results["issues"].append("Contract should mention parties involved")
+        try:
+            validation_results = {
+                "content_length": len(content),
+                "word_count": len(content.split()),
+                "paragraph_count": len([p for p in content.split('\n\n') if p.strip()]),
+                "has_content": len(content.strip()) > 0,
+                "document_type": document_type.value,
+                "validation_passed": True,
+                "issues": [],
+                "recommendations": []
+            }
             
-            if "consideration" not in content.lower():
-                validation_results["issues"].append("Contract should specify consideration")
-        
-        elif document_type == DocumentType.WILL:
-            if "will" not in content.lower() and "testament" not in content.lower():
-                validation_results["issues"].append("Will document should contain 'will' or 'testament'")
+            if validation_results["content_length"] < 50:
+                validation_results["issues"].append("Document content is very short")
+                validation_results["validation_passed"] = False
             
-            if "executor" not in content.lower():
-                validation_results["issues"].append("Will should name an executor")
-        
-        elif document_type == DocumentType.NDA:
-            if "confidential" not in content.lower():
-                validation_results["issues"].append("NDA should mention confidentiality")
+            if validation_results["word_count"] < 10:
+                validation_results["issues"].append("Document has very few words")
+                validation_results["validation_passed"] = False
             
-            if "disclosure" not in content.lower():
-                validation_results["issues"].append("NDA should address disclosure terms")
-        
-        if validation_results["issues"]:
-            validation_results["is_valid"] = False
-        
-        return validation_results
+            required_elements = {
+                DocumentType.CONTRACT: ["party", "agreement", "term"],
+                DocumentType.LEASE: ["tenant", "landlord", "rent", "property"],
+                DocumentType.NDA: ["confidential", "disclosure", "information"],
+                DocumentType.WILL: ["testator", "executor", "beneficiary"],
+                DocumentType.POWER_OF_ATTORNEY: ["attorney", "principal", "power"]
+            }
+            
+            if document_type in required_elements:
+                found_elements = []
+                for element in required_elements[document_type]:
+                    if element.lower() in content.lower():
+                        found_elements.append(element)
+                
+                missing_elements = [e for e in required_elements[document_type] if e not in found_elements]
+                
+                if missing_elements:
+                    validation_results["issues"].append(f"Missing key elements: {', '.join(missing_elements)}")
+                    validation_results["recommendations"].append(f"Consider adding content related to: {', '.join(missing_elements)}")
+            
+            logger.info(f"Validated document content for {document_type.value}")
+            return validation_results
+            
+        except Exception as e:
+            logger.error(f"Error validating document content: {str(e)}")
+            raise
     
     async def get_storage_statistics(self, owner_id: Optional[int] = None) -> Dict[str, Any]:
-        """Get file storage statistics."""
         try:
-            total_size = 0
-            file_count = 0
-            
             if owner_id:
                 user_dir = self.storage_path / f"user_{owner_id}"
-                if user_dir.exists():
-                    for file_path in user_dir.rglob("*"):
-                        if file_path.is_file():
-                            total_size += file_path.stat().st_size
-                            file_count += 1
+                if not user_dir.exists():
+                    return {"total_files": 0, "total_size": 0, "storage_path": str(user_dir)}
+                
+                files = list(user_dir.glob("*"))
             else:
-                # Calculate for all users
-                for file_path in self.storage_path.rglob("*"):
-                    if file_path.is_file():
-                        total_size += file_path.stat().st_size
-                        file_count += 1
+                files = list(self.storage_path.rglob("*"))
+                files = [f for f in files if f.is_file()]
+            
+            total_size = sum(f.stat().st_size for f in files if f.is_file())
+            
+            file_types = {}
+            for file in files:
+                if file.is_file():
+                    ext = file.suffix.lower()
+                    file_types[ext] = file_types.get(ext, 0) + 1
             
             return {
-                "total_files": file_count,
-                "total_storage_size": total_size,
-                "storage_size_mb": round(total_size / (1024 * 1024), 2),
-                "storage_path": str(self.storage_path)
+                "total_files": len(files),
+                "total_size": total_size,
+                "total_size_mb": round(total_size / (1024 * 1024), 2),
+                "file_types": file_types,
+                "storage_path": str(self.storage_path),
+                "processor": "LangChain"
             }
             
         except Exception as e:

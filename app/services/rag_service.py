@@ -1,85 +1,72 @@
-import faiss
 import json
 import os
 from pathlib import Path
-from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Any, Optional, Tuple
 import hashlib
 import logging
 import uuid
-import pickle
 from datetime import datetime
 from ..config import settings
 import numpy as np
-import re
+
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
+from langchain.chains import RetrievalQA
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+
+from .langchain_config import langchain_config, LegalRAGChain
 
 logger = logging.getLogger(__name__)
 
-class RAGService:
+class LangChainRAGService:
     def __init__(self):
-        self.faiss_index_path = Path(settings.faiss_index_path)
+        self.config = langchain_config
+        self.embedding_model = self.config.embedding_model
+        self.text_splitter = self.config.text_splitter
+        self.llm = self.config.anthropic_llm
+        
+        self.vector_store_path = Path(settings.faiss_index_path)
         self.metadata_storage_path = Path(settings.metadata_storage_path)
+        self.vector_store_path.mkdir(exist_ok=True)
+        self.metadata_storage_path.mkdir(exist_ok=True)
         
-        self.embedding_model = SentenceTransformer(settings.embedding_model)
-        self.embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
-        
-        self.index = None
+        self.vector_store = None
         self.metadata_store = {}
-        self.id_to_index_map = {}
-        self.index_to_id_map = {}
-        self.next_index = 0
         
-        self._load_index()
+        self._load_vector_store()
         self._load_metadata()
     
-    def _load_index(self):
-        index_file = self.faiss_index_path / "legal_documents.index"
-        map_file = self.faiss_index_path / "id_mappings.pkl"
-        
-        if index_file.exists():
+    def _load_vector_store(self):
+        index_path = self.vector_store_path / "faiss_index"
+        if index_path.exists():
             try:
-                self.index = faiss.read_index(str(index_file))
-                logger.info(f"Loaded FAISS index with {self.index.ntotal} vectors")
-                
-                if map_file.exists():
-                    with open(map_file, 'rb') as f:
-                        mappings = pickle.load(f)
-                        self.id_to_index_map = mappings.get('id_to_index', {})
-                        self.index_to_id_map = mappings.get('index_to_id', {})
-                        self.next_index = mappings.get('next_index', 0)
-                        
+                self.vector_store = FAISS.load_local(
+                    str(index_path),
+                    self.embedding_model,
+                    allow_dangerous_deserialization=True
+                )
+                logger.info(f"Loaded FAISS vector store with {self.vector_store.index.ntotal} vectors")
             except Exception as e:
-                logger.warning(f"Failed to load FAISS index: {e}, creating new one")
-                self._create_new_index()
+                logger.warning(f"Failed to load vector store: {e}, creating new one")
+                self._create_new_vector_store()
         else:
-            self._create_new_index()
+            self._create_new_vector_store()
     
-    def _create_new_index(self):
-        self.index = faiss.IndexFlatIP(self.embedding_dim)
-        self.metadata_store = {}
-        self.id_to_index_map = {}
-        self.index_to_id_map = {}
-        self.next_index = 0
-        logger.info(f"Created new FAISS index with dimension {self.embedding_dim}")
+    def _create_new_vector_store(self):
+        dummy_doc = Document(page_content="dummy", metadata={"source": "init"})
+        self.vector_store = FAISS.from_documents([dummy_doc], self.embedding_model)
+        self.vector_store.delete([self.vector_store.index_to_docstore_id[0]])
+        logger.info("Created new FAISS vector store")
     
-    def _save_index(self):
+    def _save_vector_store(self):
         try:
-            index_file = self.faiss_index_path / "legal_documents.index"
-            map_file = self.faiss_index_path / "id_mappings.pkl"
-            
-            faiss.write_index(self.index, str(index_file))
-            
-            mappings = {
-                'id_to_index': self.id_to_index_map,
-                'index_to_id': self.index_to_id_map,
-                'next_index': self.next_index
-            }
-            with open(map_file, 'wb') as f:
-                pickle.dump(mappings, f)
-                
-            logger.info("FAISS index saved successfully")
+            index_path = self.vector_store_path / "faiss_index"
+            self.vector_store.save_local(str(index_path))
+            logger.info("FAISS vector store saved successfully")
         except Exception as e:
-            logger.error(f"Failed to save FAISS index: {e}")
+            logger.error(f"Failed to save vector store: {e}")
     
     def _load_metadata(self):
         try:
@@ -131,10 +118,35 @@ class RAGService:
                 logger.info(f"Document already exists with hash: {content_hash}")
                 return existing_doc_id
             
-            chunks = self._chunk_text(content)
+            text_chunks = self.text_splitter.split_text(content)
             
-            embeddings = self.embedding_model.encode(chunks)
-            faiss.normalize_L2(embeddings)
+            documents = []
+            for i, chunk in enumerate(text_chunks):
+                doc_metadata = {
+                    "document_id": document_id,
+                    "chunk_index": i,
+                    "document_type": document_type,
+                    "title": title,
+                    "filename": filename,
+                    "file_path": file_path,
+                    "owner_id": owner_id,
+                    "content_hash": content_hash,
+                    "created_at": datetime.now().isoformat(),
+                    "source": f"doc_{document_id}_chunk_{i}"
+                }
+                
+                if metadata:
+                    doc_metadata.update(metadata)
+                
+                documents.append(Document(
+                    page_content=chunk,
+                    metadata=doc_metadata
+                ))
+            
+            if self.vector_store.index.ntotal == 0:
+                self.vector_store = FAISS.from_documents(documents, self.embedding_model)
+            else:
+                self.vector_store.add_documents(documents)
             
             doc_metadata = metadata or {}
             doc_metadata.update({
@@ -146,30 +158,18 @@ class RAGService:
                 "owner_id": owner_id,
                 "content_hash": content_hash,
                 "created_at": datetime.now().isoformat(),
-                "total_chunks": len(chunks),
-                "chunks": [{"index": i, "content": chunk} for i, chunk in enumerate(chunks)]
+                "total_chunks": len(text_chunks),
+                "chunks": [{"index": i, "content": chunk} for i, chunk in enumerate(text_chunks)]
             })
             
-            start_index = self.next_index
-            self.index.add(embeddings)
-            
-            for i, chunk in enumerate(chunks):
-                chunk_id = f"doc_{document_id}_chunk_{i}"
-                index_pos = start_index + i
-                self.id_to_index_map[chunk_id] = index_pos
-                self.index_to_id_map[index_pos] = chunk_id
-            
-            self.next_index += len(chunks)
-            
             self._save_metadata(document_id, doc_metadata)
+            self._save_vector_store()
             
-            self._save_index()
-            
-            logger.info(f"Indexed document {document_id} with {len(chunks)} chunks")
+            logger.info(f"Indexed document {document_id} with {len(text_chunks)} chunks using LangChain")
             return document_id
             
         except Exception as e:
-            logger.error(f"Error indexing document: {str(e)}")
+            logger.error(f"Error indexing document with LangChain: {str(e)}")
             raise
 
     async def search_documents(
@@ -181,75 +181,55 @@ class RAGService:
         min_score: float = 0.3
     ) -> List[Dict[str, Any]]:
         try:
-            if self.index is None or self.index.ntotal == 0:
+            if not self.vector_store or self.vector_store.index.ntotal == 0:
                 logger.info("No documents indexed yet")
                 return []
             
-            query_embedding = self.embedding_model.encode([query])
-            faiss.normalize_L2(query_embedding)
+            filter_dict = {"owner_id": owner_id}
+            if document_type:
+                filter_dict["document_type"] = document_type
             
-            scores, indices = self.index.search(query_embedding, min(limit * 3, self.index.ntotal))
+            docs_and_scores = self.vector_store.similarity_search_with_score(
+                query, 
+                k=limit * 2,
+                filter=filter_dict
+            )
             
             search_results = []
             seen_documents = set()
             
-            for score, idx in zip(scores[0], indices[0]):
-                if idx == -1:
-                    continue
-                    
-                chunk_id = self.index_to_id_map.get(idx)
-                if not chunk_id:
-                    continue
-                    
-                document_id = chunk_id.split("_chunk_")[0].replace("doc_", "")
-                
-                if document_id not in self.metadata_store:
-                    continue
-                    
-                doc_metadata = self.metadata_store[document_id]
-                
-                if doc_metadata.get("owner_id") != owner_id:
-                    continue
-                    
-                if document_type and doc_metadata.get("document_type") != document_type:
-                    continue
-                
-                similarity_score = float(score)
+            for doc, score in docs_and_scores:
+                similarity_score = 1 - score
                 
                 if similarity_score >= min_score:
-                    chunk_index = int(chunk_id.split("_chunk_")[1])
-                    chunk_content = ""
+                    doc_metadata = doc.metadata
+                    document_id = doc_metadata.get("document_id")
                     
-                    if "chunks" in doc_metadata:
-                        for chunk in doc_metadata["chunks"]:
-                            if chunk["index"] == chunk_index:
-                                chunk_content = chunk["content"]
-                                break
-                    
-                    search_results.append({
-                        "chunk_id": chunk_id,
-                        "document_id": document_id,
-                        "title": doc_metadata.get("title", ""),
-                        "document_type": doc_metadata.get("document_type", ""),
-                        "filename": doc_metadata.get("filename", ""),
-                        "chunk_content": chunk_content,
-                        "chunk_index": chunk_index,
-                        "similarity_score": similarity_score,
-                        "metadata": doc_metadata
-                    })
-                    
-                    seen_documents.add(document_id)
-                    
-                    if len(search_results) >= limit:
-                        break
+                    if document_id not in seen_documents:
+                        search_results.append({
+                            "chunk_id": doc_metadata.get("source", ""),
+                            "document_id": document_id,
+                            "title": doc_metadata.get("title", ""),
+                            "document_type": doc_metadata.get("document_type", ""),
+                            "filename": doc_metadata.get("filename", ""),
+                            "chunk_content": doc.page_content,
+                            "chunk_index": doc_metadata.get("chunk_index", 0),
+                            "similarity_score": similarity_score,
+                            "metadata": doc_metadata
+                        })
+                        
+                        seen_documents.add(document_id)
+                        
+                        if len(search_results) >= limit:
+                            break
             
             search_results.sort(key=lambda x: x["similarity_score"], reverse=True)
             
-            logger.info(f"Found {len(search_results)} relevant chunks for query")
+            logger.info(f"Found {len(search_results)} relevant chunks for query using LangChain")
             return search_results[:limit]
             
         except Exception as e:
-            logger.error(f"Error searching documents: {str(e)}")
+            logger.error(f"Error searching documents with LangChain: {str(e)}")
             return []
 
     async def search_similar_documents(
@@ -260,51 +240,30 @@ class RAGService:
         similarity_threshold: float = 0.7
     ) -> List[Dict[str, Any]]:
         try:
-            if self.index is None or self.index.ntotal == 0:
+            if not self.vector_store or self.vector_store.index.ntotal == 0:
                 logger.info("No documents indexed yet")
                 return []
             
-            query_embedding = self.embedding_model.encode([query])
-            faiss.normalize_L2(query_embedding)
+            filter_dict = {}
+            if document_types:
+                filter_dict["document_type"] = {"$in": document_types}
             
-            scores, indices = self.index.search(query_embedding, min(max_results * 2, self.index.ntotal))
+            docs_and_scores = self.vector_store.similarity_search_with_score(
+                query,
+                k=max_results * 2,
+                filter=filter_dict if filter_dict else None
+            )
             
             search_results = []
             
-            for score, idx in zip(scores[0], indices[0]):
-                if idx == -1:
-                    continue
-                    
-                chunk_id = self.index_to_id_map.get(idx)
-                if not chunk_id:
-                    continue
-                    
-                document_id = chunk_id.split("_chunk_")[0].replace("doc_", "")
-                
-                if document_id not in self.metadata_store:
-                    continue
-                    
-                doc_metadata = self.metadata_store[document_id]
-                
-                if document_types and doc_metadata.get("document_type") not in document_types:
-                    continue
-                
-                similarity_score = float(score)
+            for doc, score in docs_and_scores:
+                similarity_score = 1 - score
                 
                 if similarity_score >= similarity_threshold:
-                    chunk_index = int(chunk_id.split("_chunk_")[1])
-                    chunk_content = ""
-                    
-                    if "chunks" in doc_metadata:
-                        for chunk in doc_metadata["chunks"]:
-                            if chunk["index"] == chunk_index:
-                                chunk_content = chunk["content"]
-                                break
-                    
                     search_results.append({
-                        "chunk_id": chunk_id,
-                        "content": chunk_content,
-                        "metadata": doc_metadata,
+                        "chunk_id": doc.metadata.get("source", ""),
+                        "content": doc.page_content,
+                        "metadata": doc.metadata,
                         "similarity_score": similarity_score
                     })
                     
@@ -316,7 +275,7 @@ class RAGService:
             return search_results[:max_results]
             
         except Exception as e:
-            logger.error(f"Error searching documents: {str(e)}")
+            logger.error(f"Error searching documents with LangChain: {str(e)}")
             raise
 
     async def get_relevant_context(
@@ -341,7 +300,81 @@ class RAGService:
             return chunks, document_ids, scores
             
         except Exception as e:
-            logger.error(f"Error getting relevant context: {str(e)}")
+            logger.error(f"Error getting relevant context with LangChain: {str(e)}")
+            raise
+
+    async def create_rag_qa_chain(self) -> RetrievalQA:
+        try:
+            if not self.vector_store:
+                raise ValueError("Vector store not initialized")
+            
+            rag_chain = LegalRAGChain(self.config, self.vector_store)
+            return rag_chain.create_qa_chain()
+            
+        except Exception as e:
+            logger.error(f"Error creating RAG QA chain: {str(e)}")
+            raise
+
+    async def ask_question(
+        self,
+        question: str,
+        owner_id: Optional[int] = None,
+        document_types: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        try:
+            if not self.vector_store:
+                return {"answer": "No documents indexed yet", "sources": []}
+            
+            filter_dict = {}
+            if owner_id:
+                filter_dict["owner_id"] = owner_id
+            if document_types:
+                filter_dict["document_type"] = {"$in": document_types}
+            
+            retriever = self.vector_store.as_retriever(
+                search_kwargs={"k": 5, "filter": filter_dict if filter_dict else None}
+            )
+            
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", """You are a legal AI assistant. Use the following legal documents context to provide accurate and helpful responses. 
+                Always cite relevant sources and indicate when information comes from the provided context versus general legal knowledge.
+                
+                Context:
+                {context}"""),
+                ("human", "{question}")
+            ])
+            
+            def format_docs(docs):
+                return "\n\n".join(f"Source: {doc.metadata.get('title', 'Unknown')}\n{doc.page_content}" for doc in docs)
+            
+            rag_chain = (
+                {"context": retriever | format_docs, "question": RunnablePassthrough()}
+                | prompt
+                | self.llm
+                | StrOutputParser()
+            )
+            
+            answer = rag_chain.invoke(question)
+            
+            source_docs = retriever.get_relevant_documents(question)
+            sources = [
+                {
+                    "title": doc.metadata.get("title", "Unknown"),
+                    "document_id": doc.metadata.get("document_id"),
+                    "chunk_index": doc.metadata.get("chunk_index"),
+                    "content": doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content
+                }
+                for doc in source_docs
+            ]
+            
+            return {
+                "answer": answer,
+                "sources": sources,
+                "question": question
+            }
+            
+        except Exception as e:
+            logger.error(f"Error answering question with LangChain RAG: {str(e)}")
             raise
 
     async def update_document_index(
@@ -368,11 +401,11 @@ class RAGService:
                 metadata=metadata
             )
             
-            logger.info(f"Updated index for document {document_id}")
+            logger.info(f"Updated index for document {document_id} using LangChain")
             return updated_doc_id
             
         except Exception as e:
-            logger.error(f"Error updating document index {document_id}: {str(e)}")
+            logger.error(f"Error updating document index {document_id} with LangChain: {str(e)}")
             raise
 
     async def delete_document_index(self, document_id: str):
@@ -384,74 +417,28 @@ class RAGService:
             doc_metadata = self.metadata_store[document_id]
             total_chunks = doc_metadata.get("total_chunks", 0)
             
-            chunk_ids_to_remove = []
-            indices_to_remove = []
-            
+            ids_to_delete = []
             for chunk_index in range(total_chunks):
-                chunk_id = f"doc_{document_id}_chunk_{chunk_index}"
-                if chunk_id in self.id_to_index_map:
-                    faiss_index = self.id_to_index_map[chunk_id]
-                    chunk_ids_to_remove.append(chunk_id)
-                    indices_to_remove.append(faiss_index)
+                source_id = f"doc_{document_id}_chunk_{chunk_index}"
+                for doc_id, doc in self.vector_store.docstore._dict.items():
+                    if doc.metadata.get("source") == source_id:
+                        ids_to_delete.append(doc_id)
             
-            for chunk_id in chunk_ids_to_remove:
-                faiss_index = self.id_to_index_map.pop(chunk_id, None)
-                if faiss_index is not None:
-                    self.index_to_id_map.pop(faiss_index, None)
+            if ids_to_delete:
+                self.vector_store.delete(ids_to_delete)
             
             self._delete_metadata(document_id)
+            self._save_vector_store()
             
-            self._save_index()
-            
-            logger.info(f"Deleted {len(chunk_ids_to_remove)} chunks for document {document_id}")
+            logger.info(f"Deleted document {document_id} from LangChain vector store")
             
         except Exception as e:
-            logger.error(f"Error deleting document index {document_id}: {str(e)}")
+            logger.error(f"Error deleting document index {document_id} with LangChain: {str(e)}")
             raise
-
-    def _chunk_text(self, text: str) -> List[str]:
-        text = re.sub(r'\s+', ' ', text.strip())
-        
-        sentences = re.split(r'(?<=[.!?])\s+', text)
-        
-        chunks = []
-        current_chunk = ""
-        
-        for sentence in sentences:
-            if len(current_chunk) + len(sentence) + 1 <= settings.max_chunk_size:
-                current_chunk += (sentence + " ")
-            else:
-                if current_chunk.strip():
-                    chunks.append(current_chunk.strip())
-                current_chunk = sentence + " "
-        
-        if current_chunk.strip():
-            chunks.append(current_chunk.strip())
-        
-        if settings.chunk_overlap > 0 and len(chunks) > 1:
-            chunks = self._add_chunk_overlap(chunks)
-        
-        return chunks
-
-    def _add_chunk_overlap(self, chunks: List[str]) -> List[str]:
-        overlapped_chunks = []
-        
-        for i, chunk in enumerate(chunks):
-            if i == 0:
-                overlapped_chunks.append(chunk)
-            else:
-                previous_chunk = chunks[i - 1]
-                overlap_words = previous_chunk.split()[-settings.chunk_overlap:]
-                overlap_text = " ".join(overlap_words)
-                
-                overlapped_chunk = f"{overlap_text} {chunk}"
-                overlapped_chunks.append(overlapped_chunk)
-        
-        return overlapped_chunks
 
     async def get_collection_stats(self) -> Dict[str, Any]:
         try:
-            total_chunks = self.index.ntotal if self.index else 0
+            total_chunks = self.vector_store.index.ntotal if self.vector_store else 0
             
             doc_types = {}
             owners = set()
@@ -467,11 +454,12 @@ class RAGService:
                 "total_documents": total_documents,
                 "total_owners": len(owners),
                 "document_types": doc_types,
-                "embedding_model": settings.embedding_model
+                "embedding_model": self.config.embedding_model.model_name,
+                "vector_store_type": "LangChain_FAISS"
             }
             
         except Exception as e:
-            logger.error(f"Error getting collection stats: {str(e)}")
+            logger.error(f"Error getting collection stats with LangChain: {str(e)}")
             raise
 
     async def search_by_metadata(
@@ -480,35 +468,31 @@ class RAGService:
         max_results: int = 20
     ) -> List[Dict[str, Any]]:
         try:
-            search_results = []
+            if not self.vector_store:
+                return []
             
-            for doc_id, metadata in self.metadata_store.items():
+            all_docs = []
+            for doc_id, doc in self.vector_store.docstore._dict.items():
                 matches = True
                 for key, value in metadata_filter.items():
-                    if key not in metadata or metadata[key] != value:
+                    if key not in doc.metadata or doc.metadata[key] != value:
                         matches = False
                         break
                 
                 if matches:
-                    chunks = metadata.get("chunks", [])
-                    for chunk in chunks:
-                        chunk_id = f"doc_{doc_id}_chunk_{chunk['index']}"
-                        search_results.append({
-                            "chunk_id": chunk_id,
-                            "content": chunk["content"],
-                            "metadata": metadata
-                        })
-                        
-                        if len(search_results) >= max_results:
-                            break
-                
-                if len(search_results) >= max_results:
-                    break
+                    all_docs.append({
+                        "chunk_id": doc.metadata.get("source", ""),
+                        "content": doc.page_content,
+                        "metadata": doc.metadata
+                    })
+                    
+                    if len(all_docs) >= max_results:
+                        break
             
-            return search_results[:max_results]
+            return all_docs[:max_results]
             
         except Exception as e:
-            logger.error(f"Error searching by metadata: {str(e)}")
+            logger.error(f"Error searching by metadata with LangChain: {str(e)}")
             raise
 
     async def get_document_by_id(self, document_id: str) -> Optional[Dict[str, Any]]:
@@ -532,7 +516,7 @@ class RAGService:
             }
             
         except Exception as e:
-            logger.error(f"Error getting document {document_id}: {str(e)}")
+            logger.error(f"Error getting document {document_id} with LangChain: {str(e)}")
             raise
 
     async def list_user_documents(
@@ -571,7 +555,7 @@ class RAGService:
             return documents
             
         except Exception as e:
-            logger.error(f"Error listing documents for user {owner_id}: {str(e)}")
+            logger.error(f"Error listing documents for user {owner_id} with LangChain: {str(e)}")
             raise
 
     async def get_document_content(self, document_id: str) -> str:
@@ -591,7 +575,7 @@ class RAGService:
             return content
             
         except Exception as e:
-            logger.error(f"Error getting content for document {document_id}: {str(e)}")
+            logger.error(f"Error getting content for document {document_id} with LangChain: {str(e)}")
             raise
 
     async def check_document_exists(self, content_hash: str, owner_id: int) -> Optional[str]:
@@ -604,7 +588,7 @@ class RAGService:
             return None
             
         except Exception as e:
-            logger.error(f"Error checking document existence: {str(e)}")
+            logger.error(f"Error checking document existence with LangChain: {str(e)}")
             raise
 
     async def get_document_statistics(self, owner_id: Optional[int] = None) -> Dict[str, Any]:
@@ -626,9 +610,10 @@ class RAGService:
                 "total_documents": total_documents,
                 "total_chunks": total_chunks,
                 "document_types": document_types,
-                "embedding_model": settings.embedding_model
+                "embedding_model": self.config.embedding_model.model_name,
+                "vector_store_type": "LangChain_FAISS"
             }
             
         except Exception as e:
-            logger.error(f"Error getting document statistics: {str(e)}")
+            logger.error(f"Error getting document statistics with LangChain: {str(e)}")
             raise 
